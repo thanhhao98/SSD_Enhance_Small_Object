@@ -1,10 +1,13 @@
 import torch
 from torch import nn
+from torchvision.ops import nms
 from models.utils import (
     Bottleneck,
     PyramidFeatures,
     RegressionModel,
-    ClassificationModel
+    ClassificationModel,
+    BBoxTransform,
+    ClipBoxes,
 )
 from models.anchors import (
     Anchors
@@ -77,6 +80,8 @@ class ResNet(nn.Module):
             num_classes=num_classes
         )
         self.anchors = Anchors()
+        self.regressBoxes = BBoxTransform()
+        self.clipBoxes = ClipBoxes()
 
     def _make_layer(self, planes, blocks, stride=1):
         downsample = None
@@ -96,6 +101,12 @@ class ResNet(nn.Module):
         for i in range(1, blocks):
             layers.append(Bottleneck(self.in_planes, planes))
         return nn.Sequential(*layers)
+
+    def freeze_bn(self):
+        '''Freeze BatchNorm layers.'''
+        for layer in self.modules():
+            if isinstance(layer, nn.BatchNorm2d):
+                layer.eval()
 
     def forward(self, inputs):
         if self.training:
@@ -126,5 +137,45 @@ class ResNet(nn.Module):
         if self.training:
             pass
         else:
-            pass
-        return features, regression, classification
+            transformed_anchors = self.regressBoxes(anchors, regression)
+            transformed_anchors = self.clipBoxes(
+                transformed_anchors,
+                img_batch
+            )
+            finalResult = [[], [], []]
+
+            finalScores = torch.Tensor([])
+            finalAnchorBoxesIndexes = torch.Tensor([]).long()
+            finalAnchorBoxesCoordinates = torch.Tensor([])
+
+            if torch.cuda.is_available():
+                finalScores = finalScores.cuda()
+                finalAnchorBoxesIndexes = finalAnchorBoxesIndexes.cuda()
+                finalAnchorBoxesCoordinates = finalAnchorBoxesCoordinates.cuda()
+
+            for i in range(classification.shape[2]):
+                scores = torch.squeeze(classification[:, :, i])
+                scores_over_thresh = (scores > 0.05)
+                if scores_over_thresh.sum() == 0:
+                    # no boxes to NMS, just continue
+                    continue
+
+                scores = scores[scores_over_thresh]
+                anchorBoxes = torch.squeeze(transformed_anchors)
+                anchorBoxes = anchorBoxes[scores_over_thresh]
+                anchors_nms_idx = nms(anchorBoxes, scores, 0.5)
+
+                finalResult[0].extend(scores[anchors_nms_idx])
+                finalResult[1].extend(torch.tensor([i] * anchors_nms_idx.shape[0]))
+                finalResult[2].extend(anchorBoxes[anchors_nms_idx])
+
+                finalScores = torch.cat((finalScores, scores[anchors_nms_idx]))
+                finalAnchorBoxesIndexesValue = torch.tensor([i] * anchors_nms_idx.shape[0])
+                if torch.cuda.is_available():
+                    finalAnchorBoxesIndexesValue = finalAnchorBoxesIndexesValue.cuda()
+
+                finalAnchorBoxesIndexes = torch.cat((finalAnchorBoxesIndexes, finalAnchorBoxesIndexesValue))
+                finalAnchorBoxesCoordinates = torch.cat((finalAnchorBoxesCoordinates, anchorBoxes[anchors_nms_idx]))
+
+            return finalScores, finalAnchorBoxesIndexes, finalAnchorBoxesCoordinates
+
